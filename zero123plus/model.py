@@ -241,7 +241,7 @@ class MVDiffusion(pl.LightningModule):
 
         outputs = []
         for cond_img in images_pil:
-            latent = self.pipeline(cond_img, num_inference_steps=75, output_type='latent').images
+            latent = self.pipeline(cond_img, num_inference_steps=30, output_type='latent').images
             image = unscale_image(self.pipeline.vae.decode(latent / self.pipeline.vae.config.scaling_factor, return_dict=False)[0])   # [-1, 1]
             image = (image * 0.5 + 0.5).clamp(0, 1)
             outputs.append(image)

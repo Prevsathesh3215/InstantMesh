@@ -10,6 +10,8 @@ from omegaconf import OmegaConf
 from einops import rearrange, repeat
 from tqdm import tqdm
 from diffusers import DiffusionPipeline, EulerAncestralDiscreteScheduler
+import atexit
+
 
 from src.utils.train_util import instantiate_from_config
 from src.utils.camera_util import (
@@ -23,7 +25,6 @@ from src.utils.infer_util import remove_background, resize_foreground, images_to
 import tempfile
 from huggingface_hub import hf_hub_download
 
-
 if torch.cuda.is_available() and torch.cuda.device_count() >= 2:
     device0 = torch.device('cuda:0')
     device1 = torch.device('cuda:1')
@@ -31,14 +32,10 @@ else:
     device0 = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
     device1 = device0
 
-# Define the cache directory for model files
 model_cache_dir = './ckpts/'
 os.makedirs(model_cache_dir, exist_ok=True)
 
-def get_render_cameras(batch_size=1, M=120, radius=2.5, elevation=10.0, is_flexicubes=False):
-    """
-    Get the rendering camera parameters.
-    """
+def get_render_cameras(batch_size=1, M=36, radius=2.5, elevation=10.0, is_flexicubes=False):
     c2ws = get_circular_camera_poses(M=M, radius=radius, elevation=elevation)
     if is_flexicubes:
         cameras = torch.linalg.inv(c2ws)
@@ -50,24 +47,15 @@ def get_render_cameras(batch_size=1, M=120, radius=2.5, elevation=10.0, is_flexi
         cameras = cameras.unsqueeze(0).repeat(batch_size, 1, 1)
     return cameras
 
-
 def images_to_video(images, output_path, fps=30):
-    # images: (N, C, H, W)
     os.makedirs(os.path.dirname(output_path), exist_ok=True)
     frames = []
     for i in range(images.shape[0]):
         frame = (images[i].permute(1, 2, 0).cpu().numpy() * 255).astype(np.uint8).clip(0, 255)
-        assert frame.shape[0] == images.shape[2] and frame.shape[1] == images.shape[3], \
-            f"Frame shape mismatch: {frame.shape} vs {images.shape}"
-        assert frame.min() >= 0 and frame.max() <= 255, \
-            f"Frame value out of range: {frame.min()} ~ {frame.max()}"
+        assert frame.shape[0] == images.shape[2] and frame.shape[1] == images.shape[3]
+        assert frame.min() >= 0 and frame.max() <= 255
         frames.append(frame)
     imageio.mimwrite(output_path, np.stack(frames), fps=fps, codec='h264')
-
-
-###############################################################################
-# Configuration.
-###############################################################################
 
 seed_everything(0)
 
@@ -79,28 +67,30 @@ infer_config = config.infer_config
 
 IS_FLEXICUBES = True if config_name.startswith('instant-mesh') else False
 
-device = torch.device('cuda')
-
-# load diffusion model
 print('Loading diffusion model ...')
 pipeline = DiffusionPipeline.from_pretrained(
     "sudo-ai/zero123plus-v1.2", 
     custom_pipeline="zero123plus",
-    torch_dtype=torch.float16,
+    torch_dtype=torch.float32,
     cache_dir=model_cache_dir
 )
 pipeline.scheduler = EulerAncestralDiscreteScheduler.from_config(
     pipeline.scheduler.config, timestep_spacing='trailing'
 )
 
-# load custom white-background UNet
 unet_ckpt_path = hf_hub_download(repo_id="TencentARC/InstantMesh", filename="diffusion_pytorch_model.bin", repo_type="model", cache_dir=model_cache_dir)
 state_dict = torch.load(unet_ckpt_path, map_location='cpu')
 pipeline.unet.load_state_dict(state_dict, strict=True)
 
+pipeline.enable_attention_slicing()
+if hasattr(pipeline, 'enable_model_cpu_offload'):
+    pipeline.enable_model_cpu_offload()
+
 pipeline = pipeline.to(device0)
 
-# load reconstruction model
+torch.cuda.empty_cache()
+torch.cuda.ipc_collect()
+
 print('Loading reconstruction model ...')
 model_ckpt_path = hf_hub_download(repo_id="TencentARC/InstantMesh", filename="instant_mesh_large.ckpt", repo_type="model", cache_dir=model_cache_dir)
 model = instantiate_from_config(model_config)
@@ -108,7 +98,7 @@ state_dict = torch.load(model_ckpt_path, map_location='cpu')['state_dict']
 state_dict = {k[14:]: v for k, v in state_dict.items() if k.startswith('lrm_generator.') and 'source_camera' not in k}
 model.load_state_dict(state_dict, strict=True)
 
-model = model.to(device1)
+model = model.to('cpu')
 if IS_FLEXICUBES:
     model.init_flexicubes_geometry(device1, fovy=30.0)
 model = model.eval()
@@ -133,6 +123,9 @@ def preprocess(input_image, do_remove_background):
 
 def generate_mvs(input_image, sample_steps, sample_seed):
 
+    print(f"Using SEED = {sample_seed}")
+    print(f"Using SAMPLE STEPS = {sample_steps}")
+
     seed_everything(sample_seed)
     
     # sampling
@@ -140,6 +133,8 @@ def generate_mvs(input_image, sample_steps, sample_seed):
     z123_image = pipeline(
         input_image, 
         num_inference_steps=sample_steps, 
+        height=256,   # or 384
+        width=256,
         generator=generator,
     ).images[0]
 
@@ -202,8 +197,9 @@ def make3d(images):
         planes = model.forward_planes(images, input_cameras)
 
         # get video
-        chunk_size = 20 if IS_FLEXICUBES else 1
-        render_size = 384
+        # chunk_size = 20 if IS_FLEXICUBES else 1
+        chunk_size = 5
+        render_size = 192
         
         frames = []
         for i in tqdm(range(0, render_cameras.shape[1], chunk_size)):
@@ -231,6 +227,13 @@ def make3d(images):
         print(f"Video saved to {video_fpath}")
 
     mesh_fpath, mesh_glb_fpath = make_mesh(mesh_fpath, planes)
+
+
+    torch.cuda.empty_cache()
+    torch.cuda.ipc_collect()
+
+    atexit.register(lambda: os.remove(mesh_fpath) if os.path.exists(mesh_fpath) else None)
+
 
     return video_fpath, mesh_fpath, mesh_glb_fpath
 
@@ -300,14 +303,14 @@ with gr.Blocks() as demo:
                     do_remove_background = gr.Checkbox(
                         label="Remove Background", value=True
                     )
-                    sample_seed = gr.Number(value=42, label="Seed Value", precision=0)
+                    sample_seed = gr.Number(value=10, label="Seed Value", precision=0)
 
                     sample_steps = gr.Slider(
                         label="Sample Steps",
-                        minimum=30,
-                        maximum=75,
-                        value=75,
-                        step=5
+                        minimum=10,
+                        maximum=30,
+                        value=30,
+                        step=5,
                     )
 
             with gr.Row():
